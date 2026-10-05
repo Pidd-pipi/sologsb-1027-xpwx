@@ -30,6 +30,12 @@ interface ReviewComment {
   resolved: boolean;
 }
 
+interface InvalidationInfo {
+  sourceId: string;
+  sourceTitle: string;
+  fields: string[];
+}
+
 interface ProcessStep {
   id: string;
   title: string;
@@ -45,6 +51,7 @@ interface ProcessStep {
   expectedResult: string;
   status: StepStatus;
   comments: ReviewComment[];
+  invalidatedBy?: InvalidationInfo;
 }
 
 interface VersionSnapshot {
@@ -85,9 +92,37 @@ interface DiffItem {
   detail: string;
 }
 
+interface LastEdit {
+  stepId: string;
+  field: keyof ProcessStep;
+  critical: boolean;
+  revertedIds: string[];
+}
+
+interface BenchCapacityReport {
+  volumeMl: number;
+  massG: number;
+  limitVolumeMl: number;
+  limitMassG: number;
+  exceeded: boolean;
+  offenders: { id: string; title: string }[];
+}
+
 const STORAGE_KEY = 'sologsb-1027-lab-safety-v1';
 const CURRENT_AUTHOR = '周宁';
 const CURRENT_ROLE = '安全复核员';
+
+// 台面容量上限：同一实验内含危险项步骤的累计用量达到该值时拒绝冻结（可按实验室制度调整）。
+const BENCH_CAPACITY_LIMIT = { volumeMl: 1500, massG: 500 } as const;
+
+// 安全关键字段：变更后下游已确认步骤的安全结论立即失效；名称、时间等描述性字段不在其列。
+const SAFETY_CRITICAL_FIELDS: (keyof ProcessStep)[] = ['materials', 'amount', 'hazards'];
+
+const FIELD_LABELS: Record<string, string> = {
+  title: '名称', purpose: '目的', materials: '材料', equipment: '设备', amount: '用量',
+  duration: '预计时间', hazards: '危险项', controls: '控制措施', dependencies: '依赖关系',
+  safetyNote: '安全说明', expectedResult: '预期结果', status: '状态', comments: '批注'
+};
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 function uid(prefix: string): string {
@@ -225,6 +260,8 @@ function App() {
   const [selectedStepId, setSelectedStepId] = useState(process.steps[0]?.id ?? '');
   const [activeView, setActiveView] = useState<ViewId>('editor');
   const [lastModifiedId, setLastModifiedId] = useState<string | null>(null);
+  const [lastEdit, setLastEdit] = useState<LastEdit | null>(null);
+  const [freezeNotice, setFreezeNotice] = useState<string[]>([]);
   const [commentText, setCommentText] = useState('');
   const [savedLabel, setSavedLabel] = useState('本地数据已载入');
   const [online, setOnline] = useState(true);
@@ -240,6 +277,11 @@ function App() {
   const confirmedCount = process.steps.filter((step) => step.status === 'confirmed').length;
   const reviewProgress = process.steps.length ? Math.round((confirmedCount / process.steps.length) * 100) : 0;
   const versionDiff = useMemo(() => compareVersions(process, compareBaseId, compareTargetId), [process, compareBaseId, compareTargetId]);
+  const capacity = useMemo(() => checkBenchCapacity(process.steps), [process.steps]);
+  const interceptReports = useMemo(() => [...new Set([compareBaseId, compareTargetId])]
+    .map((id) => process.versions.find((version) => version.id === id))
+    .filter((version): version is VersionSnapshot => Boolean(version))
+    .map((version) => ({ version, reasons: freezeBlockReasons(version.steps) })), [process.versions, compareBaseId, compareTargetId]);
 
   useEffect(() => {
     if (!initialSaveSkipped.current) {
@@ -260,6 +302,11 @@ function App() {
       window.removeEventListener('offline', update);
     };
   }, []);
+
+  // 任何编辑都会重算冻结拦截原因，因此流程一变就清掉上一次的拦截提示。
+  useEffect(() => {
+    setFreezeNotice([]);
+  }, [process]);
 
   useEffect(() => {
     const handleKeydown = (event: KeyboardEvent) => {
@@ -292,11 +339,20 @@ function App() {
   const updateStep = (field: keyof ProcessStep, value: unknown): void => {
     if (!selectedStep) return;
     const id = selectedStep.id;
-    setLastModifiedId(id);
+    const changed = JSON.stringify((selectedStep as unknown as Record<string, unknown>)[field]) !== JSON.stringify(value);
+    const critical = changed && SAFETY_CRITICAL_FIELDS.includes(field);
+    // 先按当前状态算出将被退回的下游已确认步骤，用于影响面板的即时提示。
+    const revertedIds = critical
+      ? collectDownstream(process.steps, id).filter((downstreamId) => process.steps.find((step) => step.id === downstreamId)?.status === 'confirmed')
+      : [];
     commitProcess((draft) => {
       const step = draft.steps.find((item) => item.id === id);
-      if (step) (step as unknown as Record<string, unknown>)[field] = value;
+      if (!step) return;
+      (step as unknown as Record<string, unknown>)[field] = value;
+      if (critical) invalidateDownstreamSteps(draft, id, FIELD_LABELS[field] ?? String(field));
     });
+    setLastModifiedId(id);
+    setLastEdit({ stepId: id, field, critical, revertedIds });
   };
 
   const updateStepList = (field: 'hazards' | 'dependencies', value: string): void => {
@@ -316,6 +372,7 @@ function App() {
     });
     setSelectedStepId(id);
     setLastModifiedId(id);
+    setLastEdit(null);
     setActiveView('editor');
   };
 
@@ -326,6 +383,7 @@ function App() {
     copy.title = `${copy.title}（副本）`;
     copy.status = 'draft';
     copy.comments = [];
+    copy.invalidatedBy = undefined;
     copy.dependencies = [...copy.dependencies];
     commitProcess((draft) => {
       const index = draft.steps.findIndex((step) => step.id === selectedStep.id);
@@ -355,6 +413,7 @@ function App() {
       draft.steps.splice(nextIndex, 0, step);
     });
     setLastModifiedId(id);
+    setLastEdit(null);
   };
 
   const toggleDependency = (dependencyId: string, checked: boolean): void => {
@@ -392,8 +451,16 @@ function App() {
 
   const setStepStatus = (status: StepStatus): void => {
     if (!selectedStep) return;
-    updateStep('status', status);
-    setLastModifiedId(status === 'returned' ? selectedStep.id : null);
+    const id = selectedStep.id;
+    commitProcess((draft) => {
+      const step = draft.steps.find((item) => item.id === id);
+      if (!step) return;
+      step.status = status;
+      // 重新确认后，上游变更导致的失效记录随之了结。
+      if (status === 'confirmed') step.invalidatedBy = undefined;
+    });
+    setLastModifiedId(status === 'returned' ? id : null);
+    setLastEdit(null);
   };
 
   const resolveComment = (commentId: string): void => {
@@ -407,8 +474,10 @@ function App() {
 
   const freezeVersion = (): void => {
     if (process.status === 'frozen') return;
-    if (process.steps.some((step) => step.status !== 'confirmed') || missingSafetySteps.length) {
-      setSavedLabel('冻结条件未满足');
+    const reasons = freezeBlockReasons(process.steps);
+    if (reasons.length) {
+      setFreezeNotice(reasons);
+      setSavedLabel('冻结被拦截，请处理拦截原因后重试');
       return;
     }
     const nextNumber = nextMinorVersion(process.version);
@@ -417,13 +486,14 @@ function App() {
     commitProcess((draft) => {
       draft.versions.push({
         id: frozenVersionId, label: '复核通过冻结版', version: nextNumber,
-        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整。`,
+        createdAt: new Date().toISOString(), note: `${draft.steps.length} 个步骤全部确认，安全控制完整，台面容量未超限。`,
         author: CURRENT_AUTHOR, steps: clone(draft.steps)
       });
       draft.version = nextNumber;
       draft.status = 'frozen';
       draft.frozenAt = new Date().toISOString();
     });
+    setFreezeNotice([]);
     setSavedLabel(`版本 ${nextNumber} 已冻结`);
     setCompareBaseId(previousVersionId);
     setCompareTargetId(frozenVersionId);
@@ -439,6 +509,7 @@ function App() {
       draft.steps.forEach((step) => {
         step.status = 'draft';
         step.comments = [];
+        step.invalidatedBy = undefined;
       });
     });
     setActiveView('editor');
@@ -455,6 +526,13 @@ function App() {
     });
     setSavedLabel('已保存工作版本快照');
   };
+
+  const freezeNoticeCallout = freezeNotice.length > 0 && (
+    <Callout intent="danger" icon="lock" className="freeze-notice">
+      <strong>冻结已被拦截</strong>
+      <ul>{freezeNotice.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+    </Callout>
+  );
 
   return (
     <div className="app-shell">
@@ -514,7 +592,10 @@ function App() {
                 <button key={step.id} className={step.id === selectedStep.id ? 'selected' : ''} onClick={() => setSelectedStepId(step.id)}>
                   <span className={`step-number ${step.status}`}>{String(index + 1).padStart(2, '0')}</span>
                   <span className="step-copy"><strong>{step.title}</strong><small>{step.duration} 分钟 · {statusLabel(step.status)}</small></span>
-                  {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
+                  <span className="step-flags">
+                    {step.invalidatedBy && <Icon icon="updated" intent="warning" size={13} />}
+                    {hasMissingSafety(step) && <Icon icon="warning-sign" intent="danger" size={13} />}
+                  </span>
                 </button>
               ))}
             </div>
@@ -577,21 +658,35 @@ function App() {
               <div className="card-title"><div><span>IMPACT ANALYSIS</span><h3>变更影响提醒</h3></div><Icon icon="path-search" size={18} /></div>
               {lastModifiedId ? (
                 <>
-                  <Callout intent={impactedSteps.length ? 'warning' : 'primary'} icon={impactedSteps.length ? 'warning-sign' : 'tick'}>
-                    <strong>{impactedSteps.length ? `${impactedSteps.length} 个后续步骤受影响` : '未发现下游步骤'}</strong>
-                    <p>{impactedSteps.length ? '请重新核对依赖、用量、危险项和已确认内容。' : '当前修改没有影响其他步骤的安全条件。'}</p>
-                  </Callout>
+                  {lastEdit ? (
+                    lastEdit.critical ? (
+                      <Callout intent={lastEdit.revertedIds.length ? 'warning' : 'primary'} icon={lastEdit.revertedIds.length ? 'warning-sign' : 'tick'}>
+                        <strong>{lastEdit.revertedIds.length ? `安全字段「${FIELD_LABELS[lastEdit.field]}」已变更，${lastEdit.revertedIds.length} 个下游步骤已退回待复核` : `安全字段「${FIELD_LABELS[lastEdit.field]}」已变更`}</strong>
+                        <p>{lastEdit.revertedIds.length ? '下游安全结论已按前置依赖失效，需重新核对并确认。' : impactedSteps.length ? '下游步骤尚未确认，结论随复核自然更新。' : '未发现下游步骤，当前修改不影响其他步骤。'}</p>
+                      </Callout>
+                    ) : (
+                      <Callout intent="primary" icon="tick">
+                        <strong>仅修改「{FIELD_LABELS[lastEdit.field]}」，下游安全结论照旧</strong>
+                        <p>材料、用量、危险项未变化，已确认内容保持有效。</p>
+                      </Callout>
+                    )
+                  ) : (
+                    <Callout intent={impactedSteps.length ? 'warning' : 'primary'} icon={impactedSteps.length ? 'warning-sign' : 'tick'}>
+                      <strong>{impactedSteps.length ? `${impactedSteps.length} 个后续步骤受影响` : '未发现下游步骤'}</strong>
+                      <p>{impactedSteps.length ? '请重新核对依赖、用量、危险项和已确认内容。' : '当前修改没有影响其他步骤的安全条件。'}</p>
+                    </Callout>
+                  )}
                   <div className="impact-list">
                     {impactedSteps.map((step) => (
                       <button key={step.id} onClick={() => setSelectedStepId(step.id)}>
-                        <Icon icon={step.status === 'confirmed' ? 'endorsed' : 'circle'} intent={step.status === 'confirmed' ? 'success' : 'none'} size={13} />
-                        <span><strong>{step.title}</strong><small>{step.status === 'confirmed' ? '已确认内容，需重新复核' : `当前状态：${statusLabel(step.status)}`}</small></span>
+                        <Icon icon={step.invalidatedBy ? 'warning-sign' : step.status === 'confirmed' ? 'endorsed' : 'circle'} intent={step.invalidatedBy ? 'warning' : step.status === 'confirmed' ? 'success' : 'none'} size={13} />
+                        <span><strong>{step.title}</strong><small>{step.invalidatedBy ? `已退回待复核 · 变动字段：${step.invalidatedBy.fields.join('、')}` : `当前状态：${statusLabel(step.status)}`}</small></span>
                         <Icon icon="chevron-right" size={12} />
                       </button>
                     ))}
                   </div>
                 </>
-              ) : <p className="muted">编辑任一步骤后，这里会显示受影响的所有后续步骤和已确认内容。</p>}
+              ) : <p className="muted">编辑任一步骤后，这里会显示受影响的所有后续步骤；材料、用量、危险项变更会使下游已确认步骤退回待复核。</p>}
             </Card>
 
             <Card elevation={Elevation.ONE} className="safety-card">
@@ -605,7 +700,15 @@ function App() {
               <div className="card-title"><div><span>RELEASE GATE</span><h3>提交与冻结</h3></div></div>
               <div className="gate-row"><span>复核状态</span><strong>{confirmedCount}/{process.steps.length}</strong></div>
               <div className="gate-row"><span>安全缺口</span><strong className={missingSafetySteps.length ? 'danger-text' : ''}>{missingSafetySteps.length}</strong></div>
+              <div className="gate-row"><span>台面容量</span><strong className={capacity.exceeded ? 'danger-text' : ''}>{formatQuantity(capacity.volumeMl)}/{capacity.limitVolumeMl} mL · {formatQuantity(capacity.massG)}/{capacity.limitMassG} g</strong></div>
               <div className="gate-row"><span>流程状态</span><strong>{processStatusLabel(process.status)}</strong></div>
+              {capacity.exceeded && (
+                <Callout intent="danger" icon="warning-sign" className="capacity-callout">
+                  <strong>危险品累计用量触及台面容量上限</strong>
+                  <p>超限步骤：{capacity.offenders.map((offender) => offender.title).join('、')}。冻结将被拒绝。</p>
+                </Callout>
+              )}
+              {freezeNoticeCallout}
               <Divider />
               {process.status === 'frozen' ? <Button fill intent="warning" icon="git-branch" text="从冻结版创建修订" onClick={startRevision} /> : <Button fill intent="primary" icon="send-to" text="提交复核" onClick={submitForReview} />}
             </Card>
@@ -619,7 +722,7 @@ function App() {
             <div className="panel-heading"><div><span>REVIEW QUEUE</span><h3>逐条复核</h3></div><Tag intent={pendingReviewCount ? 'warning' : 'success'}>{pendingReviewCount ? `${pendingReviewCount} 待处理` : '已完成'}</Tag></div>
             {process.steps.map((step, index) => (
               <button key={step.id} className={`${step.id === selectedStep.id ? 'selected' : ''} ${step.status}`} onClick={() => setSelectedStepId(step.id)}>
-                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
+                <span>{String(index + 1).padStart(2, '0')}</span><div><strong>{step.title}</strong><small>{statusLabel(step.status)}{step.invalidatedBy ? ' · 上游变更' : ''}</small></div><Icon icon={step.status === 'confirmed' ? 'tick-circle' : step.status === 'returned' ? 'undo' : 'circle'} size={15} />
               </button>
             ))}
           </aside>
@@ -636,6 +739,11 @@ function App() {
                   <div className="review-section"><h4>控制措施</h4><p>{selectedStep.controls || '未填写'}</p></div>
                   <div className="review-section"><h4>安全说明</h4><p className={hasMissingSafety(selectedStep) ? 'danger-text' : ''}>{selectedStep.safetyNote || '未填写'}</p></div>
                   {hasMissingSafety(selectedStep) && <Callout intent="danger" icon="warning-sign">当前步骤存在安全信息缺口，不能确认或冻结版本。</Callout>}
+                  {selectedStep.invalidatedBy && (
+                    <Callout intent="warning" icon="warning-sign">
+                      上游步骤《{selectedStep.invalidatedBy.sourceTitle}》的{selectedStep.invalidatedBy.fields.join('、')}发生变更，本步骤安全结论已失效并退回待复核，确认前请重新核对。
+                    </Callout>
+                  )}
                 </Card>
                 <Card elevation={Elevation.ONE} className="comment-card">
                   <div className="card-title"><div><span>REVIEW COMMENTS</span><h3>复核批注</h3></div><Tag minimal>{selectedStep.comments.length} 条</Tag></div>
@@ -659,7 +767,7 @@ function App() {
           <aside className="review-actions">
             <Card elevation={Elevation.ONE}>
               <div className="card-title"><div><span>REVIEWER ACTION</span><h3>复核决定</h3></div><Icon icon="endorsed" size={18} /></div>
-              <p className="muted">确认后若修改该步骤，受影响的下游步骤会在编辑页重新提示。</p>
+              <p className="muted">上游步骤的材料、用量或危险项变更后，依赖它的已确认步骤会自动退回待复核。</p>
               <Button fill large intent="success" icon="tick" text="逐条确认" disabled={hasMissingSafety(selectedStep)} onClick={() => setStepStatus('confirmed')} />
               <Button fill large icon="undo" text="退回修改" intent="warning" onClick={() => setStepStatus('returned')} />
               <Button fill large minimal icon="refresh" text="恢复为待复核" onClick={() => setStepStatus('submitted')} />
@@ -667,6 +775,7 @@ function App() {
               <div className="review-progress-list">
                 {process.steps.map((step) => <div key={step.id}><span>{step.title}</span><Tag minimal intent={step.status === 'confirmed' ? 'success' : step.status === 'returned' ? 'danger' : 'warning'}>{statusLabel(step.status)}</Tag></div>)}
               </div>
+              {freezeNoticeCallout}
               <Button fill intent="primary" icon="lock" text="全部确认后冻结" onClick={freezeVersion} disabled={process.status === 'frozen'} />
             </Card>
           </aside>
@@ -696,13 +805,27 @@ function App() {
               {versionDiff.map((diff) => <div className={`diff-row ${diff.kind}`} key={diff.id}><Tag minimal intent={diff.kind === 'added' ? 'success' : diff.kind === 'removed' ? 'danger' : 'primary'}>{diff.kind === 'added' ? '新增' : diff.kind === 'removed' ? '删除' : '修改'}</Tag><strong>{diff.title}</strong><p>{diff.detail}</p></div>)}
               {!versionDiff.length && <div className="empty-diff"><Icon icon="comparison" size={30} /><strong>两个版本没有差异</strong><p>请选择不同版本，或先冻结新的流程版本。</p></div>}
             </div>
+            <div className="intercept-block">
+              <div className="intercept-head"><Icon icon="lock" size={13} /><strong>冻结拦截原因</strong><span>已冻结版本保持原样，此处按当前规则重算</span></div>
+              {interceptReports.map(({ version, reasons }) => (
+                <div className="intercept-row" key={version.id}>
+                  <Tag minimal intent={reasons.length ? 'danger' : 'success'}>{reasons.length ? `${reasons.length} 项拦截` : '可冻结'}</Tag>
+                  <strong>{version.version} · {version.label}</strong>
+                  {reasons.length
+                    ? <ul>{reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>
+                    : <p className="muted">无拦截原因，该版本满足冻结条件。</p>}
+                </div>
+              ))}
+            </div>
           </Card>
           <Card elevation={Elevation.ONE} className="freeze-rules">
             <div className="card-title"><div><span>FREEZE RULES</span><h3>冻结检查</h3></div></div>
             <div className={confirmedCount === process.steps.length ? 'passed' : ''}><Icon icon={confirmedCount === process.steps.length ? 'tick-circle' : 'circle'} /><span><strong>所有步骤已确认</strong><small>{confirmedCount}/{process.steps.length}</small></span></div>
             <div className={!missingSafetySteps.length ? 'passed' : ''}><Icon icon={!missingSafetySteps.length ? 'tick-circle' : 'circle'} /><span><strong>安全信息完整</strong><small>{missingSafetySteps.length} 个缺口</small></span></div>
             <div className={process.steps.every((step) => step.dependencies.every((id) => process.steps.some((item) => item.id === id))) ? 'passed' : ''}><Icon icon="git-merge" /><span><strong>依赖引用有效</strong><small>{process.steps.reduce((sum, step) => sum + step.dependencies.length, 0)} 条依赖</small></span></div>
-            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0} />
+            <div className={capacity.exceeded ? '' : 'passed'}><Icon icon={capacity.exceeded ? 'warning-sign' : 'tick-circle'} /><span><strong>台面容量{capacity.exceeded ? '超限' : '未超限'}</strong><small>{formatQuantity(capacity.volumeMl)}/{capacity.limitVolumeMl} mL · {formatQuantity(capacity.massG)}/{capacity.limitMassG} g（按含危险项步骤累计）</small></span></div>
+            {freezeNoticeCallout}
+            <Button fill intent="primary" icon="lock" text="冻结当前版本" onClick={freezeVersion} disabled={process.status === 'frozen' || confirmedCount !== process.steps.length || missingSafetySteps.length > 0 || capacity.exceeded} />
           </Card>
         </main>
       )}
@@ -717,6 +840,95 @@ function App() {
 
 function hasMissingSafety(step: ProcessStep): boolean {
   return step.hazards.length > 0 && (!step.controls.trim() || !step.safetyNote.trim());
+}
+
+// 上游安全关键字段变更后，传递依赖它的已确认步骤立即失效：退回待复核并记录变动字段。
+// 同一来源的后续变更只补充变动字段；重新确认前该记录一直保留。
+function invalidateDownstreamSteps(draft: ExperimentProcess, sourceId: string, fieldLabel: string): void {
+  const source = draft.steps.find((step) => step.id === sourceId);
+  collectDownstream(draft.steps, sourceId).forEach((id) => {
+    const target = draft.steps.find((step) => step.id === id);
+    if (!target) return;
+    if (target.status === 'confirmed') {
+      target.status = 'submitted';
+      target.invalidatedBy = { sourceId, sourceTitle: source?.title ?? '', fields: [fieldLabel] };
+    } else if (target.invalidatedBy && target.invalidatedBy.sourceId === sourceId && !target.invalidatedBy.fields.includes(fieldLabel)) {
+      target.invalidatedBy = { ...target.invalidatedBy, fields: [...target.invalidatedBy.fields, fieldLabel] };
+    }
+  });
+}
+
+// 从用量文本中解析数量与单位，统一折算为 mL / g；温度、时间等非容量单位不计入。
+function parseAmountQuantities(text: string): { volumeMl: number; massG: number } {
+  const result = { volumeMl: 0, massG: 0 };
+  const pattern = /(\d+(?:\.\d+)?)(?:\s*±\s*\d+(?:\.\d+)?)?\s*(μl|µl|ul|ml|l|mg|g|kg)\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text))) {
+    const value = Number(match[1]);
+    switch (match[2].toLowerCase()) {
+      case 'μl':
+      case 'µl':
+      case 'ul': result.volumeMl += value / 1000; break;
+      case 'ml': result.volumeMl += value; break;
+      case 'l': result.volumeMl += value * 1000; break;
+      case 'mg': result.massG += value / 1000; break;
+      case 'g': result.massG += value; break;
+      case 'kg': result.massG += value * 1000; break;
+    }
+  }
+  return result;
+}
+
+// 同一实验内按含危险项的步骤累计危险品用量，达到台面容量上限即视为超限；
+// 累计值触及上限的步骤计入超限步骤，供冻结拦截时点名。
+function checkBenchCapacity(steps: ProcessStep[]): BenchCapacityReport {
+  let volumeMl = 0;
+  let massG = 0;
+  const offenders: { id: string; title: string }[] = [];
+  steps.forEach((step) => {
+    if (!step.hazards.length) return;
+    const parsed = parseAmountQuantities(step.amount);
+    if (!parsed.volumeMl && !parsed.massG) return;
+    volumeMl += parsed.volumeMl;
+    massG += parsed.massG;
+    const hitsVolume = parsed.volumeMl > 0 && volumeMl >= BENCH_CAPACITY_LIMIT.volumeMl;
+    const hitsMass = parsed.massG > 0 && massG >= BENCH_CAPACITY_LIMIT.massG;
+    if (hitsVolume || hitsMass) offenders.push({ id: step.id, title: step.title });
+  });
+  return {
+    volumeMl,
+    massG,
+    limitVolumeMl: BENCH_CAPACITY_LIMIT.volumeMl,
+    limitMassG: BENCH_CAPACITY_LIMIT.massG,
+    exceeded: volumeMl >= BENCH_CAPACITY_LIMIT.volumeMl || massG >= BENCH_CAPACITY_LIMIT.massG,
+    offenders
+  };
+}
+
+// 冻结拦截原因：未确认步骤、安全信息缺口、台面容量超限。当前流程与历史版本快照共用。
+function freezeBlockReasons(steps: ProcessStep[]): string[] {
+  const reasons: string[] = [];
+  const unconfirmed = steps.filter((step) => step.status !== 'confirmed');
+  if (unconfirmed.length) {
+    reasons.push(`${unconfirmed.length} 个步骤未确认：${unconfirmed.map((step) => step.title).join('、')}`);
+  }
+  const gaps = steps.filter(hasMissingSafety);
+  if (gaps.length) {
+    reasons.push(`${gaps.length} 个步骤存在危险项但缺少控制措施或安全说明：${gaps.map((step) => step.title).join('、')}`);
+  }
+  const capacity = checkBenchCapacity(steps);
+  if (capacity.exceeded) {
+    const parts: string[] = [];
+    if (capacity.volumeMl >= capacity.limitVolumeMl) parts.push(`累计体积 ${formatQuantity(capacity.volumeMl)}/${capacity.limitVolumeMl} mL`);
+    if (capacity.massG >= capacity.limitMassG) parts.push(`累计质量 ${formatQuantity(capacity.massG)}/${capacity.limitMassG} g`);
+    reasons.push(`危险品累计用量触及台面容量上限（${parts.join('，')}），超限步骤：${capacity.offenders.map((offender) => offender.title).join('、')}`);
+  }
+  return reasons;
+}
+
+function formatQuantity(value: number): string {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
 }
 
 function collectDownstream(steps: ProcessStep[], sourceId: string | null): string[] {
