@@ -70,7 +70,7 @@ button, input, textarea, select { font: inherit; }
 .step-actions { padding: 9px; display: flex; justify-content: center; border-top: 1px solid #e6eaf0; background: #f8fafb; }
 .editor-main { min-width: 0; display: grid; gap: 14px; }
 .bp6-card { margin: 0; }
-.process-meta-card, .step-editor-card, .dependency-card, .review-summary, .comment-card, .impact-card, .safety-card, .gate-card, .version-panel, .diff-panel, .freeze-rules { padding: 19px; border: 1px solid var(--line); border-radius: 10px; }
+.process-meta-card, .step-editor-card, .dependency-card, .review-summary, .comment-card, .impact-card, .safety-card, .capacity-card, .gate-card, .version-panel, .diff-panel, .intercept-card, .freeze-rules { padding: 19px; border: 1px solid var(--line); border-radius: 10px; }
 .card-title { margin-bottom: 16px; }
 .meta-grid, .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
 .form-grid.two-column { grid-template-columns: 1fr 1fr; }
@@ -83,6 +83,18 @@ button, input, textarea, select { font: inherit; }
 .impact-card .bp6-callout { margin-bottom: 10px; }
 .impact-card .bp6-callout strong { display: block; font-size: 11px; }
 .impact-card .bp6-callout p { margin: 4px 0 0; font-size: 10px; }
+.changed-fields { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.changed-fields > span { flex: 0 0 auto; color: var(--muted); font-size: 10px; }
+.changed-fields > div { display: flex; flex-wrap: wrap; gap: 5px; }
+.freeze-rejection { margin: 14px 22px 0; }
+.freeze-rejection ul { margin: 8px 0 0; padding-left: 18px; font-size: 11px; line-height: 1.7; }
+.rejection-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.capacity-row { margin-bottom: 4px; }
+.capacity-head { display: flex; justify-content: space-between; gap: 10px; color: #526071; font-size: 10px; }
+.capacity-head strong { color: var(--ink); font: 600 10px "IBM Plex Mono", monospace; }
+.capacity-head strong.danger-text { color: var(--red); }
+.capacity-card .bp6-progress-bar { margin: 6px 0 10px; }
+.capacity-over { margin: -4px 0 10px; font-size: 9px; line-height: 1.6; }
 .impact-list { display: grid; }
 .impact-list button { padding: 10px 3px; display: grid; grid-template-columns: 18px 1fr 14px; gap: 6px; align-items: center; border: 0; border-bottom: 1px solid #e7ebf0; text-align: left; background: transparent; cursor: pointer; }
 .impact-list strong, .impact-list small { display: block; }
@@ -145,6 +157,12 @@ button, input, textarea, select { font: inherit; }
 .empty-diff, .freeze-rules .empty-diff { padding: 45px 20px; text-align: center; color: #7b8796; }
 .empty-diff strong { display: block; margin-top: 8px; color: #465366; }
 .empty-diff p { margin: 5px 0 0; font-size: 10px; }
+.compare-main { min-width: 0; display: grid; gap: 14px; align-content: start; }
+.intercept-card .muted { margin-bottom: 2px; }
+.intercept-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+.intercept-grid section { padding: 12px; border: 1px solid #e2e7ed; border-radius: 8px; background: #f9fafb; }
+.intercept-grid h4 { margin: 0 0 8px; color: #465365; font-size: 11px; }
+.intercept-grid ul { margin: 0; padding: 0; display: grid; gap: 6px; list-style: none; color: #4d5968; font-size: 10px; line-height: 1.6; }
 .freeze-rules > div:not(.card-title) { padding: 10px 0; display: grid; grid-template-columns: 20px 1fr; align-items: center; gap: 6px; border-bottom: 1px solid #e7ebf0; color: #8792a2; }
 .freeze-rules > div.passed { color: var(--green); }
 .freeze-rules > div strong, .freeze-rules > div small { display: block; }
@@ -172,7 +190,7 @@ button, input, textarea, select { font: inherit; }
   .workspace-tabs .bp6-tab { min-width: 135px; }
   .editor-layout, .review-layout, .compare-layout { padding: 12px; grid-template-columns: 1fr; }
   .inspector-panel, .review-actions, .freeze-rules { grid-column: auto; grid-template-columns: 1fr; position: static; }
-  .meta-grid, .form-grid, .form-grid.two-column, .dependency-grid, .review-facts { grid-template-columns: 1fr; }
+  .meta-grid, .form-grid, .form-grid.two-column, .dependency-grid, .review-facts, .intercept-grid { grid-template-columns: 1fr; }
   .comment-compose { grid-template-columns: 1fr; }
   .diff-selects { flex-wrap: wrap; justify-content: flex-end; }
   .diff-row, .diff-head { grid-template-columns: 60px 1fr; }

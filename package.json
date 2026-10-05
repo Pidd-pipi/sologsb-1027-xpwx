@@ -7,7 +7,8 @@
     "dev": "vite --host 0.0.0.0",
     "start": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "verify": "esbuild scripts/verify-safety.ts --bundle --platform=node --format=esm --outfile=node_modules/.tmp/verify-safety.mjs --log-level=warning && node node_modules/.tmp/verify-safety.mjs"
   },
   "dependencies": {
     "@blueprintjs/core": "6.20.0",
